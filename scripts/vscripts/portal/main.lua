@@ -11,6 +11,21 @@ Debugging = _G.Debugging or false
 
 tickrate = _G.tickrate or 0.05
 
+-- Portal view (camera) tuning. Tweak these in-engine; the maths in UpdateView doesn't need to change.
+local PortalView = {
+    UpdateInterval  = 0,     -- seconds between camera updates. 0 = every frame (try 0.011 if 0 misbehaves)
+    UseHmdOrigin    = true,  -- in VR use the HMD avatar origin (the point between the eyes) instead of player:EyePosition()
+    Culling         = true,  -- disable a portal's monitor while it can't be seen (saves a whole scene render)
+    MaxViewDistance = 1500,  -- units; farther away than this the monitor is disabled
+    CameraDepth     = 40,    -- max distance the exit camera may sit from the exit portal. Keep it inside the wall thickness
+    MinCameraDepth  = 12,    -- min distance (avoids a huge FOV when the eye touches the portal)
+    DynamicFov      = true,  -- fit the camera FOV to the portal opening: fov = 2 * atan(PortalHalfSize / depth)
+    PortalHalfSize  = 50,    -- half the portal opening in units (portalz / 2). At depth 50 this equals the old fixed FOV of 90
+    FovMin          = 60,
+    FovMax          = 130,
+    FovEpsilon      = 0.5,   -- only re-send ChangeFOV when it changed by more than this many degrees
+}
+
 local LightOmniTemplate = {
     targetname = "bluePortal_light_omni",
     color = "15 121 148 255",
@@ -422,6 +437,9 @@ function PortalManager:CreateViewLink()
     PortalManager.OrangeCamera = OrangeCamera
     local BluePortal = Entities:FindByName(nil,"@"..Colors.Blue .. "FuncMonitor")
     local OrangePortal = Entities:FindByName(nil,"@"..Colors.Orange .. "FuncMonitor")
+    PortalManager.BlueMonitor = BluePortal
+    PortalManager.OrangeMonitor = OrangePortal
+    PortalManager.ViewState = {}
 
     BluePortal:SetOrigin(PortalManager.BluePortalGroup[1]:GetOrigin()+ PortalManager.BluePortalGroup[1]:GetForwardVector()*2)
     OrangePortal:SetOrigin(PortalManager.OrangePortalGroup[1]:GetOrigin()+ PortalManager.OrangePortalGroup[1]:GetForwardVector()*2)
@@ -454,70 +472,101 @@ function PortalManager:CreateViewLink()
     --EntFireByHandle(thisEntity,PortalManager.OrangePortalGroup[7],"Disable")
     --EntFireByHandle(thisEntity,PortalManager.BluePortalGroup[7],"Disable")
 end
+
+local function GetViewOrigin()
+    if PortalView.UseHmdOrigin then
+        local hmd = player:GetHMDAvatar()
+        if hmd ~= nil then
+            return hmd:GetOrigin()
+        end
+    end
+    return player:EyePosition()
+end
+
+-- Updates one portal view.
+--   viewPortal is the portal the player looks at (its func_monitor shows the picture)
+--   exitPortal is the linked portal; the camera sits just behind it, looking out of it
+--   camera is the point_camera placed at exitPortal
+--   monitor is the func_monitor placed at viewPortal
+function PortalManager:UpdateOnePortalView(key, viewPortal, exitPortal, camera, monitor, eye)
+    local state = PortalManager.ViewState[key]
+    if state == nil then
+        state = {}
+        PortalManager.ViewState[key] = state
+    end
+
+    -- Eye in the local space of the portal being looked at. x points out of the portal face.
+    local e = viewPortal:TransformPointWorldToEntity(eye)
+    local dist = e:Length()
+
+    -- Culling: nothing to see from behind the portal, or from very far away.
+    local visible = true
+    if PortalView.Culling then
+        visible = e.x > 0 and dist <= PortalView.MaxViewDistance
+    end
+    if visible ~= state.enabled then
+        EntFireByHandle(thisEntity, monitor, visible and "Enable" or "Disable")
+        state.enabled = visible
+    end
+    if not visible then
+        return
+    end
+
+    -- Unit vector from the portal centre to the eye (portal space).
+    local d = math.max(dist, 1)
+    local ux, uy, uz = e.x / d, e.y / d, e.z / d
+
+    -- The view ray leaves the exit portal mirrored around the up axis: (x, y, z) -> (-x, -y, z).
+    -- The ray travels from the eye to the portal (direction -u), so in exit space it continues along (ux, uy, -uz).
+    -- The camera sits on that ray, `depth` units behind the exit portal, and looks at its centre.
+    -- Depth is limited so the camera stays inside the wall (there's no oblique near-plane clipping in VScript).
+    local depth = Clamp(dist, PortalView.MinCameraDepth, PortalView.CameraDepth)
+    local camLocal = Vector(-ux * depth, -uy * depth, uz * depth)
+    local lookLocal = Vector(ux, uy, -uz)
+
+    local camPos = exitPortal:TransformPointEntityToWorld(camLocal)
+    local lookDir = exitPortal:TransformPointEntityToWorld(lookLocal) - exitPortal:GetOrigin()
+
+    camera:SetOrigin(camPos)
+    local angles = VectorToAngles(lookDir)
+    camera:SetAngles(angles.x, angles.y, angles.z)
+
+    if PortalView.DynamicFov then
+        local fov = math.deg(2 * math.atan(PortalView.PortalHalfSize / depth))
+        fov = Clamp(fov, PortalView.FovMin, PortalView.FovMax)
+        if state.fov == nil or math.abs(fov - state.fov) > PortalView.FovEpsilon then
+            EntFireByHandle(thisEntity, camera, "ChangeFOV", tostring(fov))
+            state.fov = fov
+        end
+    end
+
+    if Debugging then
+        DebugDrawLine(eye, viewPortal:GetOrigin(), 255, 255, 0, false, 0)
+        DebugDrawLine(camPos, camPos + lookDir * 60, 0, 255, 255, false, 0)
+    end
+end
+
 function PortalManager:UpdateView()
-    if PortalManager.BlueCamera == nil or PortalManager.OrangeCamera == nil or player == nil or PortalManager.BluePortalGroup[1] == nil or PortalManager.OrangePortalGroup[1] == nil then
+    if PortalManager.BlueCamera == nil or PortalManager.OrangeCamera == nil or player == nil
+        or PortalManager.BluePortalGroup[1] == nil or PortalManager.OrangePortalGroup[1] == nil
+        or PortalManager.BlueMonitor == nil or PortalManager.OrangeMonitor == nil then
+        -- Nothing to do until both portals exist, so don't burn per-frame updates.
         return tickrate
     end
-    
-    local BlueCamera = PortalManager.BlueCamera
-    local OrangeCamera = PortalManager.OrangeCamera
+
     local BluePortal = PortalManager.BluePortalGroup[1]
     local OrangePortal = PortalManager.OrangePortalGroup[1]
-    local Player = player
+    local eye = GetViewOrigin()
 
-    local PlayerToBlue = OrangePortal:TransformPointWorldToEntity(player:EyePosition())
-    local PlayerToBlueOrg = BluePortal:TransformPointEntityToWorld(-PlayerToBlue)
-    local PlayerToOrange = BluePortal:TransformPointWorldToEntity(player:EyePosition())
-    local PlayerToOrangeOrg = OrangePortal:TransformPointEntityToWorld(-PlayerToOrange)
-    PlayerToOrange.z = PlayerToOrange.z * -1
-    PlayerToBlue.z = PlayerToBlue.z * -1
-    PlayerToBlue.x = Clamp(PlayerToBlue.x, 0, 40)
-    PlayerToBlue.y = Clamp(PlayerToBlue.y/10, -15,15)
-    PlayerToBlue.z = Clamp(PlayerToBlue.z/10, -10,10)
+    -- The orange monitor shows the camera sitting at the blue portal, and vice versa.
+    PortalManager:UpdateOnePortalView("orange", OrangePortal, BluePortal, PortalManager.BlueCamera, PortalManager.OrangeMonitor, eye)
+    PortalManager:UpdateOnePortalView("blue", BluePortal, OrangePortal, PortalManager.OrangeCamera, PortalManager.BlueMonitor, eye)
 
-    PlayerToOrange.x = Clamp(PlayerToOrange.x, 0, 40)
-    PlayerToOrange.y = Clamp(PlayerToOrange.y/10, -15, 15)
-    PlayerToOrange.z = Clamp(PlayerToOrange.z/10, -10, 10)
-    --print(PlayerToOrange)
-
-    local OrangeCamPos = OrangePortal:TransformPointEntityToWorld(-PlayerToOrange)
-    OrangeCamera:SetOrigin(OrangeCamPos)
-    local BlueCamPos = BluePortal:TransformPointEntityToWorld(-PlayerToBlue)
-    BlueCamera:SetOrigin(BlueCamPos)
-
-
-    local angles = VectorToAngles(OrangePortal:TransformPointEntityToWorld(PlayerToOrange) - OrangePortal:GetOrigin())
-    OrangeCamera:SetAngles(angles.x,angles.y,angles.z)
-
-    angles = VectorToAngles(BluePortal:TransformPointEntityToWorld(PlayerToBlue) - BluePortal:GetOrigin())
-    BlueCamera:SetAngles(angles.x,angles.y,angles.z)
-
-    --the smaller x of PlayerToOrangeOrg is the higher the FOV is
-    --1 meter is 100 units
-    --local OrangeFOV = 300/abs(PlayerToOrangeOrg.x)
-    --local BlueFOV =  300/abs(PlayerToBlueOrg.x)
-    ----print(abs(PlayerToOrangeOrg.x))
-    ----print(tostring(OrangeFOV))
-    ----print(tostring(BlueFOV))
-    --OrangeFOV = Lerp(Clamp(OrangeFOV-0.5,0,1),50, 90)
-    --BlueFOV = Lerp(Clamp(BlueFOV-0.5,0,1), 50, 90)
---
-    --local BlueCamFOV = Clamp(abs((1/PlayerToOrangeOrg:Length())*-0.1),10,180)
-    --local OrangeCamFOV = Clamp(abs((1/PlayerToBlueOrg:Length())*-0.1),10,180)
---
-    --EntFireByHandle(nil,BlueCamera,"ChangeFOV",tostring(BlueFOV))
-    --EntFireByHandle(nil,OrangeCamera,"ChangeFOV",tostring(OrangeFOV))
-
-   
---
-    --print("_______")
-
-
-
-    return tickrate
+    return PortalView.UpdateInterval
 end
 
 function PortalManager:CloseViewLink()
+    PortalManager.ViewState = {}
     local BlueCamera = Entities:FindByName(nil,"@"..Colors.Blue .. "PointCamera")
     local OrangeCamera = Entities:FindByName(nil,"@"..Colors.Orange .. "PointCamera")
     local BluePortal = Entities:FindByName(nil,"@"..Colors.Blue .. "FuncMonitor")
